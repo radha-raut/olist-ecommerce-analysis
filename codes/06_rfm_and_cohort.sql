@@ -1,0 +1,115 @@
+-- RFM SEGMENTATION ON DELIVERED ORDERS, ONE ROW PER UNIQUE CUSTOMER.
+
+DROP TABLE IF EXISTS ANALYTICS.CUSTOMER_RFM;
+
+
+CREATE TABLE ANALYTICS.CUSTOMER_RFM AS
+WITH BASE AS (
+    SELECT C.CUSTOMER_UNIQUE_ID,
+           MAX(F.PURCHASE_DATE) AS LAST_PURCHASE_DATE,
+           COUNT(*) AS FREQUENCY,
+           SUM(F.ITEMS_REVENUE) AS MONETARY
+    FROM ANALYTICS.FACT_ORDERS F
+    JOIN ANALYTICS.DIM_CUSTOMERS C ON F.CUSTOMER_ID = C.CUSTOMER_ID
+    WHERE F.IS_DELIVERED
+    GROUP BY C.CUSTOMER_UNIQUE_ID
+),
+SNAP AS (
+    SELECT MAX(PURCHASE_DATE) + 1 AS SNAPSHOT_DATE
+    FROM ANALYTICS.FACT_ORDERS
+    WHERE IS_DELIVERED
+),
+RFM AS (
+    SELECT B.*,
+           (S.SNAPSHOT_DATE - B.LAST_PURCHASE_DATE) AS RECENCY_DAYS
+    FROM BASE B CROSS JOIN SNAP S
+),
+SCORED AS (
+    SELECT *,
+           NTILE(5) OVER (ORDER BY RECENCY_DAYS DESC) AS R_SCORE,
+           CASE WHEN FREQUENCY = 1 THEN 1
+                WHEN FREQUENCY = 2 THEN 2
+                ELSE 3 END AS F_SCORE,
+           NTILE(5) OVER (ORDER BY MONETARY ASC) AS M_SCORE
+    FROM RFM
+)
+SELECT *,
+       CASE
+         WHEN F_SCORE >= 2 AND R_SCORE >= 4 THEN 'champions'
+         WHEN F_SCORE >= 2 THEN 'loyal_repeat'
+         WHEN R_SCORE >= 4 AND M_SCORE >= 4 THEN 'new_high_value'
+         WHEN R_SCORE >= 4 THEN 'new_customers'
+         WHEN R_SCORE <= 3 AND M_SCORE >= 4 THEN 'at_risk_high_value'
+         WHEN R_SCORE <= 2 THEN 'lost'
+         ELSE 'about_to_sleep'
+       END AS SEGMENT
+FROM SCORED;
+
+
+ALTER TABLE ANALYTICS.CUSTOMER_RFM ADD PRIMARY KEY (CUSTOMER_UNIQUE_ID);
+
+-- 93,358 customers and revenue 13,221,498.11 
+SELECT COUNT(*) AS CUSTOMERS,
+       ROUND(SUM(MONETARY), 2) AS TOTAL_REVENUE
+FROM ANALYTICS.CUSTOMER_RFM;
+
+/* at_risk_high_value is the biggest revenue pool with 22.21% of customers but 41.98% of revenue (avg spend 267.66, last purchase ~337 days ago). 
+new_high_value adds 29.23% of revenue (15.50% of customers, recent buyers). 
+Together these two high-spend segments (~38% of customers) generate ~71% of revenue.
+loyal_repeat (1,600) and champions (1,201) together are only 3.00% of customers and 5.51% of revenue.
+lost (24.17%) and new_customers (23.21%) are low-value segments (avg spend ~55), contributing ~9.5% of revenue each. */
+SELECT SEGMENT,
+       COUNT(*) AS CUSTOMERS,
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS CUSTOMERS_PCT,
+       ROUND(SUM(MONETARY), 2) AS REVENUE,
+       ROUND(100.0 * SUM(MONETARY) / SUM(SUM(MONETARY)) OVER (), 2) AS REVENUE_PCT,
+       ROUND(AVG(MONETARY), 2) AS AVG_SPEND,
+       ROUND(AVG(RECENCY_DAYS), 0) AS AVG_RECENCY_DAYS
+FROM ANALYTICS.CUSTOMER_RFM
+GROUP BY SEGMENT
+ORDER BY REVENUE DESC;
+
+
+DROP TABLE IF EXISTS ANALYTICS.COHORT_RETENTION;
+
+
+CREATE TABLE ANALYTICS.COHORT_RETENTION AS
+WITH ORDERS_C AS (
+    SELECT C.CUSTOMER_UNIQUE_ID,
+           DATE_TRUNC('month', F.PURCHASE_DATE)::DATE AS ORDER_MONTH
+    FROM ANALYTICS.FACT_ORDERS F
+    JOIN ANALYTICS.DIM_CUSTOMERS C ON F.CUSTOMER_ID = C.CUSTOMER_ID
+    WHERE F.IS_DELIVERED
+),
+FIRST_M AS (
+    SELECT CUSTOMER_UNIQUE_ID,
+           MIN(ORDER_MONTH) AS COHORT_MONTH
+    FROM ORDERS_C
+    GROUP BY CUSTOMER_UNIQUE_ID
+),
+ACTIVITY AS (
+    SELECT DISTINCT
+           O.CUSTOMER_UNIQUE_ID,
+           FM.COHORT_MONTH,
+           ((EXTRACT(YEAR  FROM O.ORDER_MONTH) - EXTRACT(YEAR  FROM FM.COHORT_MONTH)) * 12
+          + (EXTRACT(MONTH FROM O.ORDER_MONTH) - EXTRACT(MONTH FROM FM.COHORT_MONTH)))::INT AS MONTH_NUMBER
+    FROM ORDERS_C O
+    JOIN FIRST_M FM ON O.CUSTOMER_UNIQUE_ID = FM.CUSTOMER_UNIQUE_ID
+)
+SELECT COHORT_MONTH,
+       MONTH_NUMBER,
+       COUNT(*) AS ACTIVE_CUSTOMERS,
+       ROUND(100.0 * COUNT(*) /
+             FIRST_VALUE(COUNT(*)) OVER (PARTITION BY COHORT_MONTH ORDER BY MONTH_NUMBER), 2) AS RETENTION_PCT
+FROM ACTIVITY
+WHERE COHORT_MONTH BETWEEN '2017-01-01' AND '2018-03-01'
+GROUP BY COHORT_MONTH, MONTH_NUMBER;
+
+-- Retention is very low: only 0.47% of a cohort buys again in month 1, then it stays flat at about 0.23% to 0.35% for months 2 to 6 (avg of 15 monthly cohorts, Jan 2017 to Mar 2018)
+SELECT month_number,
+       ROUND(AVG(retention_pct), 2) AS avg_retention_pct,
+       COUNT(*) AS cohorts_included
+FROM analytics.cohort_retention
+WHERE month_number BETWEEN 0 AND 6
+GROUP BY month_number
+ORDER BY month_number;
